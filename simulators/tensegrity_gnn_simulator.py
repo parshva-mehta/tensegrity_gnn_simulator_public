@@ -1,6 +1,7 @@
 from typing import Dict, Union, Tuple, Optional
 
 import torch
+from torch.func import jacrev
 from torch_geometric.data import Data as Graph
 
 from gnn_physics.data_processors.abstract_tensegrity_data_processor import AbstractRobotGraphDataProcessor
@@ -280,3 +281,41 @@ class TensegrityHybridGNNSimulator(Tensegrity5dRobotSimulator):
         )
 
         return next_state, graph
+
+    
+    def compute_jacobian(self, curr_state, dt, sample_index: int = 0):
+        if curr_state.dim() == 2:
+            curr_state = curr_state.unsqueeze(-1)
+        if curr_state.dim() != 3:
+            raise ValueError(f"curr_state must have shape (B,D,1) or (B,D); got {curr_state.shape}")
+
+        B, state_dim, _ = curr_state.shape
+        if not (0 <= sample_index < B):
+            raise IndexError(f"sample_index {sample_index} out of range for batch size {B}")
+
+        # Select the sample and enable gradients on x_k for Jacobian extraction.
+        x0 = curr_state[sample_index:sample_index+1].detach().clone().requires_grad_(True)
+
+        #  Define the differentiable NN transition map f(x_k) -> x_{k+1}.
+        def gnn_next_state(x):
+            graph = self.gnn_sim.process_gnn(x)
+            body_mask = graph.body_mask.flatten()
+            next_state = self.data_processor.node2pose(
+                graph.p_node_pos[body_mask],
+                graph.node_pos[body_mask],
+                self.robot.num_nodes_per_rod,
+            )
+            return next_state.reshape(-1)  # (D_out,)
+
+        #  Evaluate output dimension so Jacobian shape can be validated.
+        y0 = gnn_next_state(x0)
+        out_dim = y0.numel()
+        if out_dim != state_dim:
+            raise ValueError(f"Expected next_state dim {state_dim}, got {out_dim}")
+
+        #  Use autodiff (jacrev) to compute J_x0^f = d f / d x_k at x0.
+        J = jacrev(gnn_next_state)(x0)          # (D_out, 1, D, 1)
+        #  Reshape autodiff output into the EKF matrix form (state_dim x state_dim).
+        J = J.reshape(out_dim, state_dim)       # (D_out, D)
+
+        return J

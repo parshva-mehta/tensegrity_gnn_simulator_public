@@ -1,2 +1,7 @@
 .DS_code
 .idea
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import tqdm
 
+from ekf import run_ekf_rollout
 from mujoco_visualizer_utils.mujoco_visualizer import MuJoCoVisualizer
 from utilities import torch_quaternion
 from utilities.misc_utils import DEFAULT_DTYPE
@@ -30,7 +31,7 @@ def rollout_by_ctrls(simulator,
             if start_state is not None \
             else simulator.get_curr_state()
         pose = curr_state.reshape(-1, 13, 1)[:, :7].flatten()
-        frames.append({"time": time, "pose": pose})
+        frames.append({"time": time, "pose": pose, "state": curr_state.detach().clone()})
 
         for ctrl in tqdm.tqdm(ctrls):
             curr_state, _ = simulator.step(
@@ -41,7 +42,7 @@ def rollout_by_ctrls(simulator,
 
             time += dt
             pose = curr_state.reshape(-1, 13, 1)[:, :7].flatten()
-            frames.append({'time': time, 'pose': pose})
+            frames.append({'time': time, 'pose': pose, 'state': curr_state.detach().clone()})
 
     return frames
 
@@ -80,6 +81,29 @@ def compute_mean_errors(gt_data, rollout_poses):
     return avg_com_err, avg_pen_err, avg_rot_err
 
 
+def save_rollout_txt(rollout_poses, txt_path):
+    """
+    Write rollout to a text file in the same format as rollout_states.txt:
+    One line per timestep with all bars' data concatenated (13 values per bar).
+    Format: x y z qw qx qy qz vx vy vz wx wy wz (bar 0) ... (bar N) - all on one line.
+    Frames must contain 'state' (1, state_dim, 1) or (state_dim,) with 13 dims per rod.
+    No header lines, no time, no bar_idx - just the raw values concatenated.
+    """
+    with open(txt_path, "w") as f:
+        for frame in rollout_poses:
+            state = frame.get("state")
+            if state is None:
+                raise ValueError("rollout_poses frames must include 'state' for save_rollout_txt")
+            if torch.is_tensor(state):
+                state = state.detach().cpu().numpy()
+            state = np.asarray(state).reshape(-1, 13)
+            # Concatenate all bars' data on one line (13 values per bar)
+            values = []
+            for row in state:
+                values.extend([f"{row[i]:.6f}" for i in range(13)])
+            f.write(" ".join(values) + "\n")
+
+
 def save_video(dt, gt_data, rollout_poses, vid_path):
     vis = MuJoCoVisualizer()
     vis.set_xml_path(Path('mujoco_visualizer_utils/xml/3prism_real_upscaled_vis_w_gt.xml'))
@@ -101,7 +125,12 @@ def evaluate(simulator,
              gt_data,
              extra_gt_data,
              dt,
-             vid_path=None):
+             vid_path=None,
+             rollout_txt_path=None,
+             use_ekf=False,
+             ekf_process_noise=1e-4,
+             ekf_measurement_noise=1e-3,
+             ekf_use_finite_diff=True):
     ctrls = [e['controls'] for e in extra_gt_data]
     init_rest_lengths = extra_gt_data[0]['rest_lengths']
     init_motor_speeds = extra_gt_data[0]['motor_speeds']
@@ -130,15 +159,29 @@ def evaluate(simulator,
         angvel.reshape(-1, 3, 1),
     ]).reshape(1, -1, 1)
 
-    rollout_poses = rollout_by_ctrls(
-        simulator,
-        ctrls,
-        dt,
-        start_state
-    )
+    if use_ekf:
+        rollout_poses = run_ekf_rollout(
+            simulator,
+            gt_data,
+            extra_gt_data,
+            dt,
+            process_noise_scale=ekf_process_noise,
+            measurement_noise_scale=ekf_measurement_noise,
+            start_state=start_state,
+            use_finite_diff=ekf_use_finite_diff,
+        )
+    else:
+        rollout_poses = rollout_by_ctrls(
+            simulator,
+            ctrls,
+            dt,
+            start_state
+        )
 
     if vid_path:
         save_video(dt, gt_data, rollout_poses, vid_path)
+    if rollout_txt_path:
+        save_rollout_txt(rollout_poses, rollout_txt_path)
 
     avg_com_err, avg_pen_err, avg_rot_err = (
         compute_mean_errors(gt_data, rollout_poses))
@@ -148,7 +191,7 @@ def evaluate(simulator,
 
 if __name__ == '__main__':
     model_path = Path("sample_model.pt")
-    data_dir_path = Path("../data_sets/mjc_synthetic_5d_0.01/val/R2S2Rrolling_7/")
+    data_dir_path = Path("../tensegrity/data_sets/mjc_synthetic_5d_0.01/val/R2S2Rrolling_7/")
     vid_path = Path("./vid.mp4")
 
     simulator = torch.load(model_path, map_location='cpu')
@@ -156,12 +199,14 @@ if __name__ == '__main__':
     simulator.to('cpu')
 
     gt_data_json = json.load((data_dir_path / "processed_data.json").open('r'))
-    extra_data_json = json.load((data_dir_path / "5d_extra_state_data.json").open('r'))
-
+    extra_data_json = json.load((data_dir_path / "5d_extra_state_data.json").open('r'))    
+    rollout_txt_path = Path("./rollout_ekf.txt")  # use rollout_gnn.txt when use_ekf=False
     avg_com_err, avg_pen_err, avg_rot_err = \
         evaluate(simulator,
                  gt_data_json,
                  extra_data_json,
+                 use_ekf=True,
                  dt=0.01,
-                 vid_path=vid_path)
+                 vid_path=vid_path,
+                 rollout_txt_path=rollout_txt_path)
     print(avg_com_err, avg_pen_err, avg_rot_err)

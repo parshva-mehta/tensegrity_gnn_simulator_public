@@ -51,7 +51,6 @@ python-dateutil==2.8.2
 pytz==2022.5
 requests==2.28.1
 scikit-learn==1.1.2
-scipy==1.9.3
 six==1.16.0
 sklearn==0.0
 stack-data==0.6.2
@@ -60,6 +59,7 @@ threadpoolctl==3.1.0
 torch==2.1.2
 torchvision==0.16.2
 torch_geometric==2.4.0
+gtsam>=4.2
 tqdm==4.64.1
 traitlets==5.8.1
 typing_extensions==4.4.0

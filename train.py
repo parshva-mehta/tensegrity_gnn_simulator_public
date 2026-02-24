@@ -17,9 +17,10 @@ def train():
 
     num_steps = [1, 2, 4, 8]
     epochs = [200, 100, 50, 25]
+    #epochs = [1, 1, 1, 1]
     learning_rates = [1e-5, 1e-6, 1e-7, 1e-8]
     batch_sizes = [128, 128, 128, 128]
-    load_sim = [False, True, True, True]
+    load_sim = [False, False, False, False]
     eval_steps = [20, 10, 5, 5]
 
     params = list(zip(num_steps, epochs, learning_rates, load_sim, batch_sizes, eval_steps))
@@ -34,7 +35,8 @@ def train():
                                               torch.nn.MSELoss(),
                                               0.01)
 
-        trainer.to('cuda')
+#        trainer.to('cuda')
+        trainer.to('cpu')
         trainer.run(e)
 
         output_dir = Path(config_file['output_path'])

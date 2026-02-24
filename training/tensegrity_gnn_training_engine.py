@@ -41,6 +41,9 @@ class TensegrityGNNTrainingEngine(BaseStateObject):
         self.dt = dt  # timestep size
         self.max_batch_size = training_config['batch_size']  # batch size
 
+        # Toggle to compute/print GNN Jacobians during rollout eval
+        self.expose_jacobians = training_config.get("expose_jacobians", False)
+
         # Used for loading previously trained simulators
         self.load_sim = training_config['load_sim'] \
             if 'load_sim' in training_config else False
@@ -599,6 +602,8 @@ class TensegrityGNNTrainingEngine(BaseStateObject):
             curr_state = states[i][0].clone()
             gaits = target_gaits[i]
             pred_endpts = []
+            # Global integration step counter for this trajectory
+            global_step = 0
             # TODO: remove gaits here
             for j, tg in enumerate(tqdm.tqdm(gaits)):
                 curr_gait_idx = tg['idx']
@@ -620,6 +625,19 @@ class TensegrityGNNTrainingEngine(BaseStateObject):
                             dt,
                             control_signals=controls[:, :, m]
                         )
+                        if self.expose_jacobians and global_step == 0:
+                            with torch.enable_grad():
+                                F = self.simulator.compute_jacobian(
+                                    curr_state=curr_state,
+                                    dt=dt if isinstance(dt, float) else float(dt),
+                                    sample_index=0,
+                                )
+                            frob = F.norm().item()
+                            print(
+                                f"[GNN Jacobian] traj={i}, step={global_step}, "
+                                f"shape={tuple(F.shape)}, f_norm={frob:.3e}"
+                            )
+                        global_step += 1
                         endpts = self._batch_compute_end_pts(curr_state)
                         pred_endpts.append(endpts)
 
