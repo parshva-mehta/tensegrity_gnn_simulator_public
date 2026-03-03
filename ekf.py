@@ -83,7 +83,7 @@ def _linearize_step_finite_diff(
         eps_vec[base + 7 : base + 10] = eps_vel
         eps_vec[base + 10 : base + 13] = eps_vel
 
-    # Finite-diff linearization step 2: evaluate nominal next state at x_k.
+    # Finite-diff linearization step 2: evaluate nominal next state at x_k. 
     with torch.no_grad():
         step_out = simulator.step(state_0, dt, control_signals=control_signals)
         full_next = (step_out[0] if isinstance(step_out, tuple) else step_out).detach()
@@ -168,8 +168,17 @@ def linearize_gnn(simulator, state, dt, control_signals=None, sample_index=0, us
     # Linearization step C: get the nominal next state f(x_k, u_k) at the current linearization point.
     gnn_sim = getattr(simulator, 'gnn_sim', simulator)
     with torch.no_grad():
-        step_out = gnn_sim.step(state_0, dt, ctrls=control_signals)
-        full_next = step_out[0] if isinstance(step_out, tuple) else step_out
+        # Use process_gnn -> node2pose directly so nominal state and Jacobian use the same GNN map.
+        # This avoids calling gnn_sim.step(), which may require simulator internals (e.g., rigid_body).
+        data_processor = gnn_sim.data_processor
+        robot = data_processor.robot
+        graph = gnn_sim.process_gnn(state_0)
+        body_mask = graph.body_mask.flatten()
+        full_next = data_processor.node2pose(
+            graph.p_node_pos[body_mask],
+            graph.node_pos[body_mask],
+            robot.num_nodes_per_rod,
+        )
         next_state_0 = full_next[sample_index : sample_index + 1].clone()
 
     # Linearization step D: prefer simulator-provided Jacobian routine (usually NN/autodiff based).
@@ -239,9 +248,60 @@ def _reinit_state_jitter(kf, state, state_dim, jitter=1e-8):
     return kf.init(mean_col, P_jittered)
 
 
+def _control_to_numpy_vector(ctrl):
+    """Convert control input to a flat float64 numpy vector."""
+    if ctrl is None:
+        return None
+    if isinstance(ctrl, torch.Tensor):
+        return ctrl.detach().cpu().numpy().reshape(-1).astype(np.float64)
+    if isinstance(ctrl, np.ndarray):
+        return ctrl.reshape(-1).astype(np.float64)
+    if isinstance(ctrl, (list, tuple)):
+        vals = []
+        for c in ctrl:
+            if isinstance(c, torch.Tensor):
+                vals.extend(c.detach().cpu().numpy().reshape(-1).astype(np.float64).tolist())
+            else:
+                vals.append(float(c))
+        return np.asarray(vals, dtype=np.float64)
+    return np.asarray([float(ctrl)], dtype=np.float64)
+
+
+def _get_simulator_control_jacobian(simulator, state_torch, dt, ctrl, sample_index=0):
+    """Query simulator (or gnn_sim) for control Jacobian d f / d u."""
+    candidates = [simulator, getattr(simulator, "gnn_sim", None)]
+    for cand in candidates:
+        if cand is None or not hasattr(cand, "compute_control_jacobian"):
+            continue
+        fn = getattr(cand, "compute_control_jacobian")
+        try:
+            J_u = fn(
+                curr_state=state_torch,
+                dt=dt,
+                control_signals=ctrl,
+                sample_index=sample_index,
+            )
+        except TypeError:
+            try:
+                J_u = fn(state_torch, dt, ctrl, sample_index)
+            except TypeError:
+                J_u = fn(state_torch, dt, ctrl)
+        if J_u is None:
+            continue
+        if torch.is_tensor(J_u):
+            J_u = J_u.detach().cpu().numpy()
+        J_u = np.asarray(J_u, dtype=np.float64)
+        if J_u.ndim != 2:
+            raise ValueError(f"compute_control_jacobian must return 2D, got shape {J_u.shape}")
+        return J_u
+    return None
+
+
 def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
                     H_np, z_np, Q_sigmas, R_sigmas, n_rods, have_measurement,
-                    use_finite_diff, innovation_gate_sigma=np.inf):
+                    use_finite_diff, innovation_gate_sigma=np.inf,
+                    control_jacobian_mode="identity",
+                    require_control_jacobian=False):
     """Perform one EKF predict and optionally update step using GTSAM.
 
     Predicts via linearized dynamics (finite-diff or GNN), then if have_measurement
@@ -291,21 +351,37 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
         Q_sigmas_safe = np.maximum(Q_sigmas, 1e-6)
 
     # [TENSEGRITY_EKF 1.2] Use NN Jacobians to compute J_x, J_o, J_u
-    # Here: J_x uses F_np; J_u is approximated with identity control mapping B_cont; J_o is provided as H_np in the update block.
+    # J_x uses F_np. J_u is simulator-provided when available; otherwise fallback.
     F_cont = np.ascontiguousarray(F_np, dtype=np.float64)
-    B_cont = np.ascontiguousarray(np.eye(state_dim, dtype=np.float64))
-    # [TENSEGRITY_EKF 1.3] Compute prediction error / residual
-    b = np.asarray(next_state_0_np - F_np @ x_mean, dtype=np.float64).reshape(state_dim, 1)
+    u_np = _control_to_numpy_vector(ctrl)
+    J_u = None
+    if control_jacobian_mode == "simulator":
+        J_u = _get_simulator_control_jacobian(simulator, state_torch, ctrl=ctrl, dt=dt, sample_index=0)
+        if J_u is None and require_control_jacobian:
+            raise RuntimeError(
+                "control_jacobian_mode='simulator' requested but simulator.compute_control_jacobian is unavailable."
+            )
+    if J_u is not None and u_np is not None and J_u.shape[1] == u_np.size:
+        J_u = np.ascontiguousarray(J_u, dtype=np.float64)
+        # [TENSEGRITY_EKF 1.3] Compute prediction error / residual (affine remainder)
+        b_aff = np.asarray(next_state_0_np - F_np @ x_mean - J_u @ u_np, dtype=np.float64).reshape(state_dim, 1)
+        B_cont = np.hstack([J_u, np.eye(state_dim, dtype=np.float64)])
+        u_eff = np.concatenate([u_np.reshape(-1), b_aff.reshape(-1)]).reshape(-1, 1)
+    else:
+        B_cont = np.ascontiguousarray(np.eye(state_dim, dtype=np.float64))
+        b_aff = np.asarray(next_state_0_np - F_np @ x_mean, dtype=np.float64).reshape(state_dim, 1)
+        u_eff = b_aff
     model_q = gtsam.noiseModel.Diagonal.Sigmas(Q_sigmas_safe)
     # [TENSEGRITY_EKF 1.4] Build JacobianFactor from Jacobians and b = error
     # [TENSEGRITY_EKF 1.5] Eliminate factor graph into BayesNet / solve linear system
     # These steps are executed internally by GTSAM via KalmanFilter.predict(...).
     try:
-        state_pred = kf.predict(state_gtsam, F_cont, B_cont, b, model_q)
+        state_pred = kf.predict(state_gtsam, F_cont, B_cont, u_eff, model_q)
     except RuntimeError:
         F_cont = np.ascontiguousarray(np.eye(state_dim, dtype=np.float64))
-        b = np.zeros((state_dim, 1), dtype=np.float64)
-        state_pred = kf.predict(state_gtsam, F_cont, B_cont, b, model_q)
+        B_cont = np.ascontiguousarray(np.eye(state_dim, dtype=np.float64))
+        u_eff = np.zeros((state_dim, 1), dtype=np.float64)
+        state_pred = kf.predict(state_gtsam, F_cont, B_cont, u_eff, model_q)
     state_pred = _reinit_state_jitter(kf, state_pred, state_dim)
     # [TENSEGRITY_EKF 1.6] Recover posterior estimate x_hat_{k+1}^-
     if not have_measurement:
@@ -420,6 +496,118 @@ def _structured_R_sigmas(meas_dim, n_rods, pos_sigma, quat_sigma=None):
             sigmas[13 * r + 3 : 13 * r + 7] = quat_sigma
             sigmas[13 * r + 7 : 13 * r + 13] = pos_sigma
     return sigmas
+
+
+class OnlineEKF:
+    """Streaming EKF wrapper for step-by-step filtering in a timer loop.
+
+    Wraps the existing batch EKF helpers (_structured_Q_sigmas, _structured_R_sigmas,
+    _ekf_step_gtsam) for use in a real-time publisher that receives one observation
+    per timer tick.
+    """
+
+    def __init__(self, simulator, dt, n_rods,
+                 process_noise_scale=1e-4, measurement_noise_scale=1e-3,
+                 observe_pose_only=False, use_finite_diff=False,
+                 innovation_gate_sigma=np.inf,
+                 Q_quat_inflation=2.0, Q_vel_inflation=2.0,
+                 control_jacobian_mode="identity",
+                 require_control_jacobian=False):
+        self.simulator = simulator
+        self.dt = dt
+        self.n_rods = n_rods
+        self.state_dim = 13 * n_rods
+        self.process_noise_scale = process_noise_scale
+        self.measurement_noise_scale = measurement_noise_scale
+        self.observe_pose_only = observe_pose_only
+        self.use_finite_diff = use_finite_diff
+        self.innovation_gate_sigma = innovation_gate_sigma
+        self.control_jacobian_mode = control_jacobian_mode
+        self.require_control_jacobian = require_control_jacobian
+
+        base_Q_sigma = np.sqrt(float(process_noise_scale))
+        self.Q_sigmas = _structured_Q_sigmas(
+            self.state_dim, n_rods, base_Q_sigma, Q_quat_inflation, Q_vel_inflation
+        )
+
+        pos_sigma = np.sqrt(float(measurement_noise_scale))
+        if observe_pose_only:
+            meas_dim = 7 * n_rods
+            self.H_np = np.zeros((meas_dim, self.state_dim), dtype=np.float64)
+            for i in range(meas_dim):
+                self.H_np[i, i] = 1.0
+        else:
+            meas_dim = self.state_dim
+            self.H_np = np.eye(self.state_dim, dtype=np.float64)
+        self.R_sigmas = _structured_R_sigmas(meas_dim, n_rods, pos_sigma)
+
+        self.kf = gtsam.KalmanFilter(self.state_dim)
+        self.state_gtsam = None
+        self.state_torch = None
+
+    def initialize(self, start_state: torch.Tensor,
+                   rest_lengths=None, motor_speeds=None):
+        """Initialize EKF state and optionally configure simulator actuators.
+
+        Args:
+            start_state: Initial state tensor, shape (1, state_dim, 1) or compatible.
+            rest_lengths: List of cable rest lengths (passed to actuated_cables).
+            motor_speeds: List of motor speeds (passed to motor states).
+        """
+        dtype = getattr(self.simulator, 'dtype', DEFAULT_DTYPE)
+        device = getattr(self.simulator, 'device', 'cpu')
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+
+        if rest_lengths is not None and motor_speeds is not None:
+            cables = list(self.simulator.robot.actuated_cables.values())
+            for i, c in enumerate(cables):
+                c.actuation_length = c._rest_length - rest_lengths[i]
+                c.motor.motor_state.omega_t = torch.tensor(
+                    motor_speeds[i], dtype=dtype, device=device
+                ).reshape(1, 1, 1)
+
+        start_state = start_state.to(device=device, dtype=dtype)
+        if start_state.dim() == 2:
+            start_state = start_state.unsqueeze(-1)
+
+        x0_np = start_state.detach().cpu().numpy().reshape(-1, 1).astype(np.float64)
+        P0_np = float(self.measurement_noise_scale) * np.eye(self.state_dim, dtype=np.float64)
+        self.state_gtsam = self.kf.init(x0_np, P0_np)
+        self.state_torch = start_state.clone()
+
+    def step(self, z_t: np.ndarray = None, u_t=None, have_measurement=True) -> torch.Tensor:
+        """Run one EKF predict+update step.
+
+        Args:
+            z_t: Measurement vector (state_dim or pose_dim numpy array).
+            u_t: Control input for this step (list, array, or None).
+
+        Returns:
+            Filtered state tensor, shape (1, state_dim, 1).
+        """
+        if have_measurement and z_t is None:
+            raise ValueError("z_t must be provided when have_measurement=True")
+        dtype = getattr(self.simulator, 'dtype', DEFAULT_DTYPE)
+        device = getattr(self.simulator, 'device', 'cpu')
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+
+        ctrl_step = _ensure_ctrl_for_step(u_t, self.simulator)
+        with torch.no_grad():
+            mean_np, self.state_gtsam = _ekf_step_gtsam(
+                self.kf, self.state_gtsam, self.simulator,
+                self.state_torch, self.dt, ctrl_step, self.H_np, z_t,
+                self.Q_sigmas, self.R_sigmas, self.n_rods,
+                have_measurement=have_measurement, use_finite_diff=self.use_finite_diff,
+                innovation_gate_sigma=self.innovation_gate_sigma,
+                control_jacobian_mode=self.control_jacobian_mode,
+                require_control_jacobian=self.require_control_jacobian,
+            )
+        self.state_torch = torch.tensor(
+            mean_np, dtype=dtype, device=device
+        ).view(1, self.state_dim, 1)
+        return self.state_torch
 
 
 def run_ekf_rollout(simulator,

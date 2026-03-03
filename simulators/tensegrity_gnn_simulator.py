@@ -148,20 +148,17 @@ class TensegrityGNNSimulator(LearnedSimulator):
 
         return graph
 
-    def step(self, state, dt, ctrls=None):
-        self.update_state(state)
-        self.apply_controls(ctrls)
-
+    def step(self, state, dt, control_signals=None):
         graph = self.process_gnn(state)
 
         body_mask = graph.body_mask.flatten()
         next_state = self.data_processor.node2pose(
-            graph.p_pos[body_mask],
-            graph.pos[body_mask],
+            graph.p_node_pos[body_mask],
+            graph.node_pos[body_mask],
             self.robot.num_nodes_per_rod
         )
 
-        return next_state
+        return next_state, graph
 
 
 class TensegrityHybridGNNSimulator(Tensegrity5dRobotSimulator):
