@@ -130,7 +130,7 @@ def evaluate(simulator,
              use_ekf=False,
              ekf_process_noise=1e-4,
              ekf_measurement_noise=1e-3,
-             ekf_use_finite_diff=True):
+             ekf_use_finite_diff=False):
     ctrls = [e['controls'] for e in extra_gt_data]
     init_rest_lengths = extra_gt_data[0]['rest_lengths']
     init_motor_speeds = extra_gt_data[0]['motor_speeds']
