@@ -15,6 +15,115 @@ from utilities import torch_quaternion
 from utilities.misc_utils import DEFAULT_DTYPE
 
 
+def _build_quat_E_matrix(q):
+    """Build the 4x3 E matrix that maps 3D rotation vectors to quaternion tangents.
+
+    For scalar-first quaternion q = [w, x, y, z], E(q) spans the tangent space
+    of S³ at q (i.e., E(q)^T @ q = 0).
+
+    Args:
+        q: Unit quaternion as length-4 numpy array [w, x, y, z].
+
+    Returns:
+        E: (4, 3) numpy array.
+    """
+    w, x, y, z = q
+    return np.array([
+        [-x, -y, -z],
+        [ w, -z,  y],
+        [ z,  w, -x],
+        [-y,  x,  w],
+    ], dtype=np.float64)
+
+
+def _build_tangent_projections(state_mean, n_rods):
+    """Build projection matrices between 39D ambient and 36D tangent space.
+
+    Per rod, the 13D ambient block (pos3, quat4, linvel3, angvel3) maps to a
+    12D tangent block (pos3, rot_tangent3, linvel3, angvel3) using the E matrix
+    for the quaternion.
+
+    Args:
+        state_mean: Flat state vector (13*n_rods,) as numpy array.
+        n_rods: Number of rods.
+
+    Returns:
+        T_out: (12*n_rods, 13*n_rods) projection from ambient to tangent.
+        T_in: (13*n_rods, 12*n_rods) lift from tangent to ambient.
+    """
+    ambient_dim = 13 * n_rods
+    tangent_dim = 12 * n_rods
+    T_out = np.zeros((tangent_dim, ambient_dim), dtype=np.float64)
+    T_in = np.zeros((ambient_dim, tangent_dim), dtype=np.float64)
+
+    for r in range(n_rods):
+        a = 13 * r  # ambient offset
+        t = 12 * r  # tangent offset
+        q = state_mean[a + 3 : a + 7].copy()
+        qn = np.linalg.norm(q)
+        if qn > 1e-10:
+            q = q / qn
+        E = _build_quat_E_matrix(q)
+
+        # pos: identity mapping
+        T_out[t:t+3, a:a+3] = np.eye(3)
+        T_in[a:a+3, t:t+3] = np.eye(3)
+
+        # quat <-> rotation tangent
+        T_out[t+3:t+6, a+3:a+7] = 2.0 * E.T
+        T_in[a+3:a+7, t+3:t+6] = 0.5 * E
+
+        # linvel: identity mapping
+        T_out[t+6:t+9, a+7:a+10] = np.eye(3)
+        T_in[a+7:a+10, t+6:t+9] = np.eye(3)
+
+        # angvel: identity mapping
+        T_out[t+9:t+12, a+10:a+13] = np.eye(3)
+        T_in[a+10:a+13, t+9:t+12] = np.eye(3)
+
+    return T_out, T_in
+
+
+def _fix_jacobian_quaternion_rank(F_np, state_mean, n_rods, eps=1.0, max_spectral_radius=1.0):
+    """Fix rank-deficient Jacobian caused by unit-quaternion constraint.
+
+    Projects F through the tangent space of S³ (removing the rank deficiency),
+    clamps the spectral radius to prevent covariance blow-up, then adds eps
+    regularization along the constraint normal direction (q @ q^T) so the
+    result is full rank in 39D.
+
+    Args:
+        F_np: (state_dim, state_dim) Jacobian, possibly rank-deficient.
+        state_mean: Flat state vector (state_dim,) numpy array.
+        n_rods: Number of rods.
+        eps: Small regularization along the quaternion constraint direction.
+        max_spectral_radius: Clamp spectral radius to this value (default 1.0).
+
+    Returns:
+        F_fixed: (state_dim, state_dim) full-rank Jacobian.
+    """
+    T_out, T_in = _build_tangent_projections(state_mean, n_rods)
+    F_reduced = T_out @ F_np @ T_in   # (36x36), full rank
+
+    # Clamp spectral radius to prevent covariance blow-up
+    eigenvalues = np.linalg.eigvals(F_reduced)
+    spectral_radius = np.max(np.abs(eigenvalues))
+    if spectral_radius > max_spectral_radius:
+        F_reduced = F_reduced * (max_spectral_radius / spectral_radius)
+
+    F_fixed = T_in @ F_reduced @ T_out  # (39x39), rank 36
+
+    # Add eps along constraint direction per rod
+    for r in range(n_rods):
+        q = state_mean[13*r+3 : 13*r+7].copy()
+        qn = np.linalg.norm(q)
+        if qn > 1e-10:
+            q = q / qn
+        F_fixed[13*r+3:13*r+7, 13*r+3:13*r+7] += eps * np.outer(q, q)
+
+    return F_fixed
+
+
 def _renormalize_quat_block_in_flat(x_flat: torch.Tensor, rod_index: int) -> None:
     """In-place renormalize one rod's quaternion block in flattened state.
 
@@ -342,13 +451,9 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
 
     if not np.all(np.isfinite(F_np)):
         F_np = np.eye(state_dim, dtype=np.float64)
-
-    condF = np.linalg.cond(F_np)
-    if not np.isfinite(condF) or condF > 1e8:
-        F_np = np.eye(state_dim, dtype=np.float64)
-        Q_sigmas_safe = np.maximum(Q_sigmas, 1e-6) * 10.0
     else:
-        Q_sigmas_safe = np.maximum(Q_sigmas, 1e-6)
+        F_np = _fix_jacobian_quaternion_rank(F_np, x_mean, n_rods)
+    Q_sigmas_safe = np.maximum(Q_sigmas, 1e-6)
 
     # [TENSEGRITY_EKF 1.2] Use NN Jacobians to compute J_x, J_o, J_u
     # J_x uses F_np. J_u is simulator-provided when available; otherwise fallback.
@@ -377,12 +482,13 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     # These steps are executed internally by GTSAM via KalmanFilter.predict(...).
     try:
         state_pred = kf.predict(state_gtsam, F_cont, B_cont, u_eff, model_q)
+        state_pred = _reinit_state_jitter(kf, state_pred, state_dim)
     except RuntimeError:
         F_cont = np.ascontiguousarray(np.eye(state_dim, dtype=np.float64))
         B_cont = np.ascontiguousarray(np.eye(state_dim, dtype=np.float64))
         u_eff = np.zeros((state_dim, 1), dtype=np.float64)
         state_pred = kf.predict(state_gtsam, F_cont, B_cont, u_eff, model_q)
-    state_pred = _reinit_state_jitter(kf, state_pred, state_dim)
+        state_pred = _reinit_state_jitter(kf, state_pred, state_dim)
     # [TENSEGRITY_EKF 1.6] Recover posterior estimate x_hat_{k+1}^-
     if not have_measurement:
         mean_np = np.array(state_pred.mean()).reshape(-1)
@@ -390,7 +496,10 @@ def _ekf_step_gtsam(kf, state_gtsam, simulator, state_torch, dt, ctrl,
     mean_pred = np.array(state_pred.mean()).reshape(-1).copy()
     observe_pose_only = (z_np.size == 7 * n_rods)
     mean_pred_col = mean_pred.reshape(state_dim, 1)
-    P_pred = np.asarray(state_pred.covariance(), dtype=np.float64)
+    try:
+        P_pred = np.asarray(state_pred.covariance(), dtype=np.float64)
+    except RuntimeError:
+        P_pred = np.eye(state_dim, dtype=np.float64) * float(np.mean(Q_sigmas_safe**2))
     P_sym = 0.5 * (P_pred + P_pred.T) + 1e-8 * np.eye(state_dim, dtype=np.float64)
     state_pred = kf.init(mean_pred_col, P_sym)
     # [TENSEGRITY_EKF 2] Optional measurement update: error(x_hat_{k+1}^-) = x_hat_{k+1}^- ⊖ x_{k+1}^{true}

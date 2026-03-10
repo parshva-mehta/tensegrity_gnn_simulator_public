@@ -127,9 +127,9 @@ def evaluate(simulator,
              dt,
              vid_path=None,
              rollout_txt_path=None,
-             use_ekf=False,
-             ekf_process_noise=1e-4,
-             ekf_measurement_noise=1e-3,
+             use_ekf=True,
+             ekf_process_noise=1e-2,
+             ekf_measurement_noise=1e-4,
              ekf_use_finite_diff=False,
              ekf_control_jacobian_mode="simulator"):
     ctrls = [e['controls'] for e in extra_gt_data]
