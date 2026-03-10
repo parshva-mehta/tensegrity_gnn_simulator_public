@@ -316,3 +316,46 @@ class TensegrityHybridGNNSimulator(Tensegrity5dRobotSimulator):
         J = J.reshape(out_dim, state_dim)       # (D_out, D)
 
         return J
+
+    def compute_control_jacobian(self, curr_state, dt, control_signals=None,
+                                  sample_index: int = 0, eps: float = 1e-4):
+        """Compute J_u = df/d(actuation_length) via central finite differences.
+
+        For each actuated cable j, perturbs actuation_length by ±eps, runs
+        process_gnn → node2pose, and takes the central difference.
+        Restores original actuation_length after each column.
+
+        Returns:
+            J_u: tensor of shape (state_dim, n_cables), same dtype/device as curr_state.
+        """
+        if curr_state.dim() == 2:
+            curr_state = curr_state.unsqueeze(-1)
+        _, state_dim, _ = curr_state.shape
+        x0 = curr_state[sample_index:sample_index + 1].detach()
+        cables = list(self.robot.actuated_cables.values())
+        n_cables = len(cables)
+        dtype, device = x0.dtype, x0.device
+        J_u = torch.zeros(state_dim, n_cables, dtype=dtype, device=device)
+
+        with torch.no_grad():
+            for j, cable in enumerate(cables):
+                orig = cable.actuation_length.clone()
+
+                cable.actuation_length = orig + eps
+                g_plus = self.gnn_sim.process_gnn(x0)
+                mask = g_plus.body_mask.flatten()
+                x_plus = self.data_processor.node2pose(
+                    g_plus.p_node_pos[mask], g_plus.node_pos[mask],
+                    self.robot.num_nodes_per_rod).reshape(-1)
+
+                cable.actuation_length = orig - eps
+                g_minus = self.gnn_sim.process_gnn(x0)
+                mask = g_minus.body_mask.flatten()
+                x_minus = self.data_processor.node2pose(
+                    g_minus.p_node_pos[mask], g_minus.node_pos[mask],
+                    self.robot.num_nodes_per_rod).reshape(-1)
+
+                cable.actuation_length = orig
+                J_u[:, j] = (x_plus - x_minus) / (2.0 * eps)
+
+        return J_u

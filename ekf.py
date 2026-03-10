@@ -621,7 +621,8 @@ def run_ekf_rollout(simulator,
                     use_finite_diff=False,
                     Q_quat_inflation=2.0,
                     Q_vel_inflation=2.0,
-                    innovation_gate_sigma=np.inf):
+                    innovation_gate_sigma=np.inf,
+                    control_jacobian_mode="simulator"):
     """Run an EKF rollout over ground-truth data with predict/update steps.
 
     Initializes from start_state or from gt_data[0] (endpoints, linvel, angvel).
@@ -735,6 +736,7 @@ def run_ekf_rollout(simulator,
                 H_np, z_np, Q_sigmas, R_sigmas, n_rods, have_measurement,
                 use_finite_diff=use_finite_diff,
                 innovation_gate_sigma=innovation_gate_sigma,
+                control_jacobian_mode=control_jacobian_mode,
             )
             # [TENSEGRITY_EKF 1.7] Set new prior from x_hat_{k+1}^- for next step
             # state_gtsam is carried into the next loop iteration as the EKF prior.
