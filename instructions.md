@@ -183,6 +183,7 @@ such as `eval.py` are unaffected.
 | `topic_namespace` | `"/tensegrity"` | Topics are `<ns>/<rod_name>/odom`. |
 | `stamp_source` | `"wall"` | `"sim"` stamps with the rollout's simulated time — only useful with `/use_sim_time` and a `/clock` source, otherwise messages look ancient to RViz. |
 | `twist_frame` | `"body"` | Rotates the twist into body axes, per the `Odometry` convention. `"world"` publishes the raw world-frame velocities. |
+| `position_scale` | `0.1` | Simulator-units-to-meters factor for `pose.position` and `twist.linear`. `1.0` publishes raw simulator units. See below. |
 | `queue_size` | `10` | Per-topic rosbridge queue size. |
 | `connect_timeout` | `10.0` | Seconds for the websocket handshake. |
 
@@ -202,11 +203,16 @@ docker compose -f docker/docker-compose.ros-noetic.yml exec ros-noetic \
 
 Then set RViz's Fixed Frame to `world` and add an Odometry display per topic.
 
-> **Units.** Positions go out in **raw simulator units**, matching the file-based
-> path where the ROS side applies its own `data_scale_factor` (default `0.10`) to
-> convert to meters. Nothing scales the websocket path, so rods appear ~10x
-> oversized in RViz/Foxglove. Scale on the viewer side, or multiply positions by
-> `0.1` before publishing if you want true meters.
+> **Units.** Simulator lengths are 10x meters — a rod measures `3.25` in config
+> units and `0.325 m` on the ROS side, which hardcodes its endcap offsets at
+> `±0.325/2`. The publisher therefore applies `position_scale=0.1` by default, so
+> `pose.position` and `twist.linear` arrive in **true meters** and rods render at
+> the right size. `twist.angular` is rad/s and is never scaled.
+>
+> The **file** path is deliberately *not* scaled: the ROS reader applies its own
+> `data_scale_factor` (default `0.10`), so pre-scaling there would double-convert
+> and shrink the robot 100x. If you ever feed the websocket path into something
+> that also scales, pass `position_scale=1.0`.
 
 ## Troubleshooting
 

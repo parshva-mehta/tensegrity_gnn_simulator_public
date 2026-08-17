@@ -160,6 +160,24 @@ depend on a thin interface that `sim_data_publisher.py` implements.
 - **Covariance: left zeroed**, as recommended.
 - **Connection target:** `ROSBRIDGE_URL` env var, default `ws://localhost:9090`.
 
+### Units: the two paths scale differently, on purpose
+
+Simulator lengths are 10x meters. A rod measures `3.25` in
+`simulators/configs/3_bar_tensegrity_gnn_sim_config.json`, and the ROS side
+hardcodes its endcap offsets at `±0.325/2` -- a true length of `0.325 m`. The
+`interface` package converts by multiplying file data by its
+`data_scale_factor` parameter (default `0.10`).
+
+- **File path (`RolloutStateFileWriter`): raw simulator units.** The ROS reader
+  scales it, so pre-scaling would double-convert and shrink the robot 100x.
+- **Odometry path (`RodStatePublisher`): scaled to meters**, via
+  `position_scale` (default `0.1`). Nothing downstream converts this path, so
+  without it rods render 10x oversized in RViz/Foxglove. The factor applies to
+  `pose.position` and to `twist.linear` (a length per unit time); `twist.angular`
+  is rad/s and is scale-invariant, as is the orientation quaternion. Because
+  rotations are orthonormal, scaling commutes with the world->body twist
+  rotation.
+
 ### Correction: the ROS side does not consume `nav_msgs/Odometry`
 
 This document chose stock `Odometry` to avoid compiling a custom `.msg` inside

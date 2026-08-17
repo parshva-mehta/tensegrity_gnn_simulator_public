@@ -12,6 +12,11 @@ straight to ``run_ekf_rollout(publisher=...)``, or combined with
   rosbridge, one topic per rod. Carries the velocity estimates that the
   file/``TensegrityBars`` path has no fields for.
 
+Units differ between the two on purpose. The file writer emits raw simulator
+units because the ROS reader applies its own ``data_scale_factor`` (0.10); the
+Odometry path has no such consumer-side conversion, so it scales to meters
+itself (see ``DEFAULT_POSITION_SCALE``).
+
 See ``docs/ekf_ros_integration_design.md`` for the architecture. In short: this
 process holds no ROS dependency at all -- it speaks JSON-over-websocket to a
 ``rosbridge_websocket`` server running inside a ROS Noetic container, which
@@ -55,6 +60,17 @@ DEFAULT_ROSBRIDGE_URL = "ws://localhost:9090"
 ODOMETRY_MSG_TYPE = "nav_msgs/Odometry"
 DEFAULT_TOPIC_NAMESPACE = "/tensegrity"
 DEFAULT_FRAME_ID = "world"
+
+# Simulator lengths are 10x meters: a rod measures 3.25 in config units
+# (simulators/configs/3_bar_tensegrity_gnn_sim_config.json) and 0.325 m on the
+# ROS side, which hardcodes endcap offsets at +/-0.325/2. This is the same
+# conversion the interface package applies to the text-file path via its
+# `data_scale_factor` parameter (default 0.10).
+#
+# The file writer deliberately does NOT apply this -- the ROS reader scales the
+# file itself, so pre-scaling there would double-convert. Only the live
+# Odometry path, which nothing else scales, needs it.
+DEFAULT_POSITION_SCALE = 0.1
 
 # nav_msgs/Odometry carries 6x6 pose and twist covariances. The EKF's covariance
 # is 13-dim per rod (quaternion included) and has no exact closed-form
@@ -133,19 +149,24 @@ def ros_time_from_seconds(seconds):
 
 
 def build_odometry_msg(rod_name, stamp_seconds, pos, quat, linvel, angvel,
-                       frame_id=DEFAULT_FRAME_ID, twist_frame="body"):
+                       frame_id=DEFAULT_FRAME_ID, twist_frame="body",
+                       position_scale=DEFAULT_POSITION_SCALE):
     """Build a ``nav_msgs/Odometry`` message dict for one rod.
 
     Args:
         rod_name: Rod name, used as ``child_frame_id`` (e.g. ``"rod_01"``).
         stamp_seconds: Header stamp in float seconds.
-        pos: World-frame position, 3 elements.
+        pos: World-frame position, 3 elements, in simulator units.
         quat: Orientation as repo-order ``(w, x, y, z)``, 4 elements.
-        linvel: World-frame linear velocity, 3 elements.
-        angvel: World-frame angular velocity, 3 elements.
+        linvel: World-frame linear velocity, 3 elements, in simulator units.
+        angvel: World-frame angular velocity, 3 elements, in rad/s.
         frame_id: Fixed world frame for ``header.frame_id``.
         twist_frame: ``"body"`` (ROS convention, rotates twist by the inverse of
             ``quat``) or ``"world"`` (publish world-frame velocities as-is).
+        position_scale: Simulator-units-to-meters factor applied to ``pos`` and,
+            since it is a length per unit time, to ``linvel``. ``angvel`` is in
+            rad/s and is never scaled; orientation is scale-invariant. Pass
+            ``1.0`` to publish raw simulator units.
 
     Returns:
         A dict matching the ``nav_msgs/Odometry`` layout rosbridge expects.
@@ -153,8 +174,9 @@ def build_odometry_msg(rod_name, stamp_seconds, pos, quat, linvel, angvel,
     if twist_frame not in ("body", "world"):
         raise ValueError(f"twist_frame must be 'body' or 'world', got {twist_frame!r}")
 
-    pos = _as_floats(pos, 3, "pos")
-    linvel = _as_floats(linvel, 3, "linvel")
+    scale = float(position_scale)
+    pos = [v * scale for v in _as_floats(pos, 3, "pos")]
+    linvel = [v * scale for v in _as_floats(linvel, 3, "linvel")]
     angvel = _as_floats(angvel, 3, "angvel")
 
     if twist_frame == "body":
@@ -366,13 +388,18 @@ class RodStatePublisher:
             rollout's simulated time, which requires the ROS side to run with
             ``use_sim_time`` and a ``/clock`` source to display sensibly.
         twist_frame: ``"body"`` (ROS convention) or ``"world"``. See module docs.
+        position_scale: Simulator-units-to-meters factor for ``pose.position``
+            and ``twist.linear`` (default ``0.1``, so rods publish at their true
+            0.325 m length instead of 10x oversized). ``twist.angular`` is rad/s
+            and is never scaled. Pass ``1.0`` for raw simulator units.
         queue_size: Per-topic rosbridge queue size.
         connect_timeout: Seconds to wait for the websocket handshake.
     """
 
     def __init__(self, url=None, rod_names=None, frame_id=DEFAULT_FRAME_ID,
                  topic_namespace=DEFAULT_TOPIC_NAMESPACE, stamp_source="wall",
-                 twist_frame="body", queue_size=10, connect_timeout=10.0):
+                 twist_frame="body", position_scale=DEFAULT_POSITION_SCALE,
+                 queue_size=10, connect_timeout=10.0):
         if stamp_source not in ("wall", "sim"):
             raise ValueError(
                 f"stamp_source must be 'wall' or 'sim', got {stamp_source!r}"
@@ -388,6 +415,7 @@ class RodStatePublisher:
         self.topic_namespace = topic_namespace.rstrip("/")
         self.stamp_source = stamp_source
         self.twist_frame = twist_frame
+        self.position_scale = float(position_scale)
         self.queue_size = queue_size
         self.connect_timeout = connect_timeout
 
@@ -475,6 +503,7 @@ class RodStatePublisher:
             angvel,
             frame_id=self.frame_id,
             twist_frame=self.twist_frame,
+            position_scale=self.position_scale,
         )
         import roslibpy
 

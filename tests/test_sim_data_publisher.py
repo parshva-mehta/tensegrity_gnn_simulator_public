@@ -186,6 +186,7 @@ def test_build_odometry_msg_field_mapping():
         angvel=[0.4, 0.5, 0.6],
         frame_id="world",
         twist_frame="world",
+        position_scale=1.0,
     )
 
     assert msg["header"] == {
@@ -213,6 +214,7 @@ def test_build_odometry_msg_body_twist_rotates_but_pose_does_not():
         linvel=[0.0, 1.0, 0.0],
         angvel=[0.0, 0.0, 2.0],
         twist_frame="body",
+        position_scale=1.0,
     )
     # Position stays world-frame.
     assert msg["pose"]["pose"]["position"] == {"x": 1.0, "y": 2.0, "z": 3.0}
@@ -224,6 +226,101 @@ def test_build_odometry_msg_body_twist_rotates_but_pose_does_not():
     assert (lin["x"], lin["y"], lin["z"]) == pytest.approx((1.0, 0.0, 0.0), abs=1e-12)
     ang = msg["twist"]["twist"]["angular"]
     assert (ang["x"], ang["y"], ang["z"]) == pytest.approx((0.0, 0.0, 2.0), abs=1e-12)
+
+
+# -- position scaling --------------------------------------------------------
+
+def test_default_position_scale_is_ten_to_one():
+    assert sdp.DEFAULT_POSITION_SCALE == 0.1
+
+
+def test_odometry_scales_position_and_linvel_but_not_angvel():
+    msg = sdp.build_odometry_msg(
+        "rod_01",
+        stamp_seconds=0.0,
+        pos=[1.0, 2.0, 3.0],
+        quat=IDENTITY_QUAT,
+        linvel=[10.0, 20.0, 30.0],
+        angvel=[0.4, 0.5, 0.6],
+        twist_frame="world",
+    )
+    pos = msg["pose"]["pose"]["position"]
+    assert (pos["x"], pos["y"], pos["z"]) == pytest.approx((0.1, 0.2, 0.3))
+    # Linear velocity is a length per unit time, so it scales with position.
+    lin = msg["twist"]["twist"]["linear"]
+    assert (lin["x"], lin["y"], lin["z"]) == pytest.approx((1.0, 2.0, 3.0))
+    # Angular velocity is rad/s -- scale-invariant.
+    ang = msg["twist"]["twist"]["angular"]
+    assert (ang["x"], ang["y"], ang["z"]) == pytest.approx((0.4, 0.5, 0.6))
+
+
+def test_odometry_scaling_leaves_orientation_untouched():
+    msg = sdp.build_odometry_msg(
+        "rod_01", 0.0, [1.0, 2.0, 3.0], QUAT_Z90, [0.0] * 3, [0.0] * 3,
+    )
+    orient = msg["pose"]["pose"]["orientation"]
+    assert orient["z"] == pytest.approx(SQRT_HALF)
+    assert orient["w"] == pytest.approx(SQRT_HALF)
+
+
+def test_scaled_rod_length_matches_ros_side_geometry():
+    """A 3.25-unit rod must publish as 0.325 m apart, the length the ROS side
+    hardcodes as its endcap offsets (+/-0.325/2)."""
+    half = 3.25 / 2.0
+    endpoints = []
+    for sign in (+1, -1):
+        msg = sdp.build_odometry_msg(
+            "rod_01", 0.0, [0.0, 0.0, sign * half], IDENTITY_QUAT,
+            [0.0] * 3, [0.0] * 3,
+        )
+        endpoints.append(msg["pose"]["pose"]["position"]["z"])
+    assert abs(endpoints[0] - endpoints[1]) == pytest.approx(0.325)
+
+
+def test_position_scale_one_publishes_raw_units():
+    msg = sdp.build_odometry_msg(
+        "rod_01", 0.0, [1.0, 2.0, 3.0], IDENTITY_QUAT, [4.0, 5.0, 6.0],
+        [0.0] * 3, twist_frame="world", position_scale=1.0,
+    )
+    pos = msg["pose"]["pose"]["position"]
+    assert (pos["x"], pos["y"], pos["z"]) == (1.0, 2.0, 3.0)
+    lin = msg["twist"]["twist"]["linear"]
+    assert (lin["x"], lin["y"], lin["z"]) == (4.0, 5.0, 6.0)
+
+
+def test_scaling_commutes_with_body_frame_rotation():
+    """Scaling then rotating must equal rotating then scaling (R is orthonormal)."""
+    scaled = sdp.build_odometry_msg(
+        "rod_01", 0.0, [0.0] * 3, QUAT_Z90, [0.0, 10.0, 0.0], [0.0] * 3,
+        twist_frame="body", position_scale=0.1,
+    )["twist"]["twist"]["linear"]
+    raw = sdp.build_odometry_msg(
+        "rod_01", 0.0, [0.0] * 3, QUAT_Z90, [0.0, 10.0, 0.0], [0.0] * 3,
+        twist_frame="body", position_scale=1.0,
+    )["twist"]["twist"]["linear"]
+    assert scaled["x"] == pytest.approx(raw["x"] * 0.1)
+    assert scaled["y"] == pytest.approx(raw["y"] * 0.1)
+    assert scaled["z"] == pytest.approx(raw["z"] * 0.1)
+
+
+def test_publisher_applies_position_scale(fake_roslibpy):
+    with sdp.RodStatePublisher(url="ws://localhost:9090",
+                               rod_names=["rod_01"]) as pub:
+        pub.publish_state(0.0, _synthetic_state(1))
+    pos = fake_roslibpy.topics[0].published[0]["pose"]["pose"]["position"]
+    # rod 0 position block is [0, 1, 2] in the synthetic state.
+    assert (pos["x"], pos["y"], pos["z"]) == pytest.approx((0.0, 0.1, 0.2))
+
+
+def test_file_writer_is_not_scaled(tmp_path):
+    """The ROS reader applies data_scale_factor itself; pre-scaling would
+    double-convert."""
+    path = tmp_path / "out.txt"
+    with sdp.RolloutStateFileWriter(str(path)) as writer:
+        writer.publish_state(0.0, _synthetic_state(3))
+    values = [float(t) for t in path.read_text().split()]
+    assert values[0:3] == [0.0, 1.0, 2.0]
+    assert values[13:16] == [100.0, 101.0, 102.0]
 
 
 def test_build_odometry_msg_rejects_bad_twist_frame():

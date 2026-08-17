@@ -97,6 +97,7 @@ def test_real_roslibpy_emits_expected_rosbridge_frames():
             rod_names=["rod_01"],
             stamp_source="sim",
             twist_frame="world",
+            position_scale=1.0,
         )
         with pub:
             pub.publish_state(1.5, state)
