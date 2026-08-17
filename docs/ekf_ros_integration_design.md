@@ -136,3 +136,81 @@ depend on a thin interface that `sim_data_publisher.py` implements.
   `rostopic echo /tensegrity/rod_01/odom` (from inside the container) that
   messages arrive at the expected rate with sane values, and that RViz can
   render the rod's `Odometry` display without frame errors.
+
+---
+
+## Implementation notes (added during the implementation pass)
+
+### Open questions, resolved
+
+- **Velocity frame: world.** `torch_quaternion.update_quat` integrates
+  `q_new = quat_exp(0.5*dt*ang_vel) (x) q` -- angular velocity on the *left*,
+  which is the world/space-fixed convention (a body-frame rate would
+  right-multiply). `update_quat2` and `compute_ang_vel_quat` (`q_curr (x)
+  q_prev^-1`) agree, and position integrates as `pos += linear_vel * dt` with no
+  rotation (`simulators/rigid_body_simulator.py:87`,
+  `simulators/tensegrity_simulator.py:137`). So both twist components are
+  world-frame. `RodStatePublisher` rotates the twist into the body frame by
+  default to satisfy the `Odometry` convention; `twist_frame="world"` opts out.
+- **`header.stamp`: wall-clock by default.** Simulated time starts at 0, which
+  makes messages look ancient to RViz/TF unless the ROS side runs with
+  `use_sim_time` and a `/clock` source. `stamp_source="sim"` selects sim time
+  for that setup. (Note `simulated_data.launch` does expose a `sim_clock` arg
+  that starts a `sim_clock` node and sets `/use_sim_time`.)
+- **Covariance: left zeroed**, as recommended.
+- **Connection target:** `ROSBRIDGE_URL` env var, default `ws://localhost:9090`.
+
+### Correction: the ROS side does not consume `nav_msgs/Odometry`
+
+This document chose stock `Odometry` to avoid compiling a custom `.msg` inside
+the Noetic image. That constraint does not actually apply, and the choice does
+not match the existing ROS stack:
+
+- The companion catkin workspace builds `PRX-Kinodynamic/tensegrity`, whose
+  `interface` package defines `TensegrityBars` (header + `bar_red`/`bar_green`/
+  `bar_blue` as `geometry_msgs/Pose` + three `float64[36]` covariances),
+  published on `/tensegrity/gt`. The `interface/TensegrityBarsToMarkers` nodelet
+  renders *that* type, so nothing in the stack consumes `Odometry`.
+- rosbridge can publish custom types by name once they are built and sourced in
+  the container, so `TensegrityBars` was always available.
+- The real tradeoff is the reverse of the one assumed here: `TensegrityBars`
+  carries **no velocity fields**, while `Odometry` carries the twist.
+
+### The established path is a text file, whose format is already the EKF state
+
+`interface`'s own `sim_data_publisher.py` replays a whitespace-separated file,
+one line per timestep, parsed by `get_values()` as:
+
+```
+# 0:3   3:7  7:10 10:13 13:16  16:20  20:23  23:26  26:29  29:33  33:36 36:39
+# PosA quatA  VpA  VqA  PosB   quatB   VpB    VqB    PosC  quatC   VpC   VqC
+```
+
+That is exactly this repo's EKF state layout (3 rods x 13), red/green/blue map
+to rod 0/1/2 (`id_red=0, id_green=1, id_blue=2`, matching
+`trace_green_bar.py`), and `create_transform` reads the quaternion as
+`(w, x, y, z)` -- the same order used here. There is no timestamp column: the
+reader expects `PosA` at index 0.
+
+So `RolloutStateFileWriter` writes the flattened state directly, in **raw
+simulator units** -- the ROS side applies its own `data_scale_factor` (default
+`0.10`, "data is in cm, but need it in meters"), as it already does for
+`rollout_states.txt`. Consumed with:
+
+```
+roslaunch interface simulated_data.launch data_file:=/ws/rollout_ekf.txt
+```
+
+### What was implemented
+
+- `sim_data_publisher.py`: `RolloutStateFileWriter` (file path, no ROS needed),
+  `RodStatePublisher` (live `Odometry` over rosbridge), and `CompositeSink` to
+  drive both. All three expose `publish_state(time, state)`.
+- `ekf.py`: `run_ekf_rollout(..., publisher=None)`, called once for the initial
+  state and once per timestep. Unchanged behavior when `None`.
+- `docker/docker-compose.ros-noetic.yml`: wraps the catkin workspace's
+  `tensegrity:noetic` image (which already ships rosbridge + foxglove and starts
+  them via `start_bridges.sh`), mounting the workspace at `/ws`.
+
+A live `TensegrityBars` publisher was considered and deliberately not built --
+the file path covers the current workflow and preserves velocities on disk.

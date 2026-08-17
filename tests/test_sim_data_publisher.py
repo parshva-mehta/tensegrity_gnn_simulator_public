@@ -379,6 +379,143 @@ def test_connect_is_idempotent(fake_roslibpy):
     pub.close()
 
 
+# -- rollout state file writer ----------------------------------------------
+
+def _parse_ros_side(line):
+    """Reimplements interface/sim_data_publisher.py's get_values() slicing.
+
+    That node parses each line as:
+      0:3 PosA  3:7 quatA  7:10 VpA 10:13 VqA
+     13:16 PosB 16:20 quatB 20:23 VpB 23:26 VqB
+     26:29 PosC 29:33 quatC 33:36 VpC 36:39 VqC
+    and its create_transform() reads the quaternion as (w, x, y, z).
+    """
+    v = [float(t) for t in line.split()]
+    assert len(v) == 39, f"expected 39 columns, got {len(v)}"
+    return {
+        "red": {"pos": v[0:3], "quat": v[3:7]},
+        "green": {"pos": v[13:16], "quat": v[16:20]},
+        "blue": {"pos": v[26:29], "quat": v[29:33]},
+    }
+
+
+def test_file_writer_layout_matches_ros_reader(tmp_path):
+    """Rod 0/1/2 must land where the ROS node reads red/green/blue."""
+    path = tmp_path / "rollout_ekf.txt"
+    with sdp.RolloutStateFileWriter(str(path)) as writer:
+        writer.publish_state(0.0, _synthetic_state(3))
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+
+    parsed = _parse_ros_side(lines[0])
+    # rod 0 -> red, rod 1 -> green, rod 2 -> blue (id_red=0, id_green=1, id_blue=2)
+    assert parsed["red"]["pos"] == [0.0, 1.0, 2.0]
+    assert parsed["red"]["quat"] == [3.0, 4.0, 5.0, 6.0]
+    assert parsed["green"]["pos"] == [100.0, 101.0, 102.0]
+    assert parsed["green"]["quat"] == [103.0, 104.0, 105.0, 106.0]
+    assert parsed["blue"]["pos"] == [200.0, 201.0, 202.0]
+    assert parsed["blue"]["quat"] == [203.0, 204.0, 205.0, 206.0]
+
+
+def test_file_writer_has_no_timestamp_column(tmp_path):
+    """The reader expects PosA at column 0, so `time` must not be written."""
+    path = tmp_path / "out.txt"
+    with sdp.RolloutStateFileWriter(str(path)) as writer:
+        writer.publish_state(12.5, _synthetic_state(3))
+    assert len(path.read_text().split()) == 39
+    assert path.read_text().split()[0] == "0"
+
+
+def test_file_writer_one_line_per_timestep(tmp_path):
+    path = tmp_path / "out.txt"
+    with sdp.RolloutStateFileWriter(str(path)) as writer:
+        for _ in range(5):
+            writer.publish_state(0.0, _synthetic_state(3))
+        assert writer.lines_written == 5
+    lines = path.read_text().splitlines()
+    assert len(lines) == 5
+    assert all(len(line.split()) == 39 for line in lines)
+
+
+def test_file_writer_round_trips_float64_exactly(tmp_path):
+    path = tmp_path / "out.txt"
+    state = [0.1 + i * 1e-16 for i in range(39)]
+    with sdp.RolloutStateFileWriter(str(path)) as writer:
+        writer.publish_state(0.0, state)
+    recovered = [float(t) for t in path.read_text().split()]
+    assert recovered == state
+
+
+def test_file_writer_rejects_wrong_rod_count(tmp_path):
+    path = tmp_path / "out.txt"
+    with sdp.RolloutStateFileWriter(str(path)) as writer:
+        with pytest.raises(ValueError, match="ROS reader expects 3"):
+            writer.publish_state(0.0, _synthetic_state(6))
+
+
+def test_file_writer_allows_other_rod_counts_when_opted_out(tmp_path):
+    path = tmp_path / "out.txt"
+    with sdp.RolloutStateFileWriter(str(path), expected_n_rods=None) as writer:
+        writer.publish_state(0.0, _synthetic_state(6))
+    assert len(path.read_text().split()) == 78
+
+
+def test_file_writer_creates_parent_dirs(tmp_path):
+    path = tmp_path / "nested" / "deeper" / "out.txt"
+    with sdp.RolloutStateFileWriter(str(path)) as writer:
+        writer.publish_state(0.0, _synthetic_state(3))
+    assert path.exists()
+
+
+def test_file_writer_requires_open(tmp_path):
+    writer = sdp.RolloutStateFileWriter(str(tmp_path / "out.txt"))
+    with pytest.raises(RuntimeError, match="not open"):
+        writer.publish_state(0.0, _synthetic_state(3))
+
+
+def test_file_writer_close_is_idempotent(tmp_path):
+    writer = sdp.RolloutStateFileWriter(str(tmp_path / "out.txt"))
+    writer.open()
+    writer.close()
+    writer.close()
+
+
+# -- composite sink ----------------------------------------------------------
+
+def test_composite_sink_fans_out(tmp_path, fake_roslibpy):
+    path = tmp_path / "out.txt"
+    writer = sdp.RolloutStateFileWriter(str(path))
+    pub = sdp.RodStatePublisher(url="ws://localhost:9090",
+                               rod_names=["rod_01", "rod_23", "rod_45"])
+    # CompositeSink.open() must start both: writer.open() and pub.connect().
+    with sdp.CompositeSink(writer, pub) as sinks:
+        sinks.publish_state(0.0, _synthetic_state(3))
+
+    assert len(path.read_text().splitlines()) == 1
+    assert [len(t.published) for t in fake_roslibpy.topics] == [1, 1, 1]
+    assert fake_roslibpy.instances[0].terminated
+
+
+def test_composite_sink_closes_all(tmp_path):
+    class _Sink:
+        def __init__(self):
+            self.closed = False
+            self.states = []
+
+        def publish_state(self, time, state):
+            self.states.append((time, state))
+
+        def close(self):
+            self.closed = True
+
+    a, b = _Sink(), _Sink()
+    with sdp.CompositeSink(a, b) as sinks:
+        sinks.publish_state(1.0, _synthetic_state(3))
+    assert len(a.states) == len(b.states) == 1
+    assert a.closed and b.closed
+
+
 def test_rod_names_from_simulator():
     class _Robot:
         rods = {"rod_01": object(), "rod_23": object(), "rod_45": object()}

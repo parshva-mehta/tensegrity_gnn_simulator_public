@@ -1,4 +1,16 @@
-"""Stream EKF rod state estimates to ROS Noetic via rosbridge + roslibpy.
+"""Ship EKF rod state estimates to the ROS Noetic side.
+
+Two sinks, both exposing ``publish_state(time, state)`` so either can be passed
+straight to ``run_ekf_rollout(publisher=...)``, or combined with
+``CompositeSink``:
+
+* :class:`RolloutStateFileWriter` -- writes the 39-column text format the
+  `interface` package's own ``sim_data_publisher.py`` already replays via
+  ``roslaunch interface simulated_data.launch data_file:=...``. Needs no ROS
+  connection and no changes on the ROS side.
+* :class:`RodStatePublisher` -- streams live ``nav_msgs/Odometry`` over
+  rosbridge, one topic per rod. Carries the velocity estimates that the
+  file/``TensegrityBars`` path has no fields for.
 
 See ``docs/ekf_ros_integration_design.md`` for the architecture. In short: this
 process holds no ROS dependency at all -- it speaks JSON-over-websocket to a
@@ -192,6 +204,140 @@ def _flat_len(value):
     if hasattr(value, "size") and not callable(value.size):  # numpy.ndarray
         return int(value.size)
     return len(list(value))
+
+
+class RolloutStateFileWriter:
+    """Writes the whitespace-separated rollout format the ROS side already reads.
+
+    The `interface` package's own `sim_data_publisher.py` (in the companion
+    catkin workspace) parses one line per timestep as 39 floats:
+
+        # 0:3   3:7  7:10 10:13 13:16  16:20  20:23  23:26  26:29  29:33  33:36 36:39
+        # PosA quatA  VpA  VqA  PosB   quatB   VpB    VqB    PosC  quatC   VpC   VqC
+
+    which is exactly this repo's EKF state layout -- 3 rods x 13, with red,
+    green, blue as rod 0, 1, 2 -- and its quaternion is `(w, x, y, z)`, the same
+    order used here. So a line is just the flattened state, with no conversion
+    and no leading timestamp column (the reader expects PosA at index 0).
+
+    Positions are written in raw simulator units: the ROS side applies its own
+    `data_scale_factor` (default 0.10) to convert to meters, as it already does
+    for `rollout_states.txt`.
+
+    Consumed on the ROS side with, e.g.::
+
+        roslaunch interface simulated_data.launch data_file:=/ws/rollout_ekf.txt
+
+    Implements the same `publish_state(time, state)` interface as
+    `RodStatePublisher`, so it can be handed to `run_ekf_rollout(publisher=...)`
+    directly, or combined with a live publisher via `CompositeSink`.
+
+    Args:
+        path: Output file path; parent directories are created.
+        float_fmt: Per-value format. The default round-trips float64 exactly.
+        expected_n_rods: Fail loudly if the state does not hold this many rods,
+            since the ROS reader hard-codes 3 (39 columns). Pass None to allow
+            any rod count, e.g. for the 6-bar config.
+        flush_every: Flush after this many lines (0 disables explicit flushing).
+    """
+
+    def __init__(self, path, float_fmt="%.17g", expected_n_rods=3, flush_every=0):
+        self.path = path
+        self.float_fmt = float_fmt
+        self.expected_n_rods = expected_n_rods
+        self.flush_every = flush_every
+        self._file = None
+        self._lines_written = 0
+
+    def open(self):
+        """Open the output file for writing. Idempotent."""
+        if self._file is None:
+            parent = os.path.dirname(os.path.abspath(self.path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._file = open(self.path, "w")
+            self._lines_written = 0
+        return self
+
+    def close(self):
+        """Close the output file. Idempotent."""
+        if self._file is not None:
+            try:
+                self._file.close()
+            finally:
+                self._file = None
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    @property
+    def lines_written(self):
+        return self._lines_written
+
+    def publish_state(self, time, state):
+        """Append one timestep. `time` is accepted but unused -- the format has
+        no timestamp column."""
+        del time  # the reader expects PosA at column 0
+        if self._file is None:
+            raise RuntimeError(f"{type(self).__name__} is not open; call open() first")
+
+        rods = split_rod_states(state)
+        if self.expected_n_rods is not None and len(rods) != self.expected_n_rods:
+            raise ValueError(
+                f"state holds {len(rods)} rods but the ROS reader expects "
+                f"{self.expected_n_rods} ({self.expected_n_rods * STATE_DIM_PER_ROD} "
+                f"columns); pass expected_n_rods=None to override"
+            )
+
+        values = [v for rod in rods for block in rod for v in block]
+        self._file.write(" ".join(self.float_fmt % v for v in values) + "\n")
+        self._lines_written += 1
+        if self.flush_every and self._lines_written % self.flush_every == 0:
+            self._file.flush()
+        return self._lines_written
+
+
+class CompositeSink:
+    """Fans `publish_state` out to several sinks.
+
+    Lets a rollout write the ROS-readable file and stream live at the same time::
+
+        sinks = CompositeSink(RolloutStateFileWriter("rollout_ekf.txt"),
+                              RodStatePublisher(rod_names=...))
+        with sinks:
+            run_ekf_rollout(..., publisher=sinks)
+    """
+
+    def __init__(self, *sinks):
+        self.sinks = list(sinks)
+
+    def publish_state(self, time, state):
+        return [sink.publish_state(time, state) for sink in self.sinks]
+
+    def open(self):
+        for sink in self.sinks:
+            # RodStatePublisher exposes connect(); RolloutStateFileWriter open().
+            starter = getattr(sink, "open", None) or getattr(sink, "connect", None)
+            if starter is not None:
+                starter()
+        return self
+
+    def close(self):
+        for sink in self.sinks:
+            closer = getattr(sink, "close", None)
+            if closer is not None:
+                closer()
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
 
 def rod_names_from_simulator(simulator):
