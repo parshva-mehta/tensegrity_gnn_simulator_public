@@ -1,0 +1,74 @@
+# ROS Noetic + rosbridge, for consuming EKF state published by
+# sim_data_publisher.py. See docs/ekf_ros_integration_design.md.
+#
+# PROVISIONAL: the authoritative ROS-side image is the Dockerfile in the
+# separate `catkin_ws` workspace. This file is parameterized so it can point at
+# that image without being rewritten:
+#
+#   # use the catkin_ws image once it is built/published
+#   ROS_IMAGE=catkin_ws:latest docker compose \
+#     -f docker/docker-compose.ros-noetic.yml up
+#
+#   # or build it directly from a local catkin_ws checkout
+#   CATKIN_WS=../catkin_ws docker compose \
+#     -f docker/docker-compose.ros-noetic.yml --profile build up
+#
+# Defaults to plain ros:noetic-ros-base with rosbridge_suite installed on first
+# boot, so this works standalone for anyone without the catkin_ws image.
+#
+# Then, from this repo's Python env (no ROS needed):
+#   export ROSBRIDGE_URL=ws://localhost:9090
+#   python3 -c "from sim_data_publisher import RodStatePublisher; ..."
+#
+# Verify messages are arriving, from inside the container:
+#   docker compose -f docker/docker-compose.ros-noetic.yml exec ros-noetic \
+#     bash -lc 'source /opt/ros/noetic/setup.bash && rostopic echo /tensegrity/rod_01/odom'
+
+x-ros-ports: &ros-ports
+  # A publisher on the host connects to ws://localhost:9090.
+  # A sibling container instead uses ws://ros-noetic:9090 on this network.
+  - "9090:9090"
+  - "11311:11311"
+
+services:
+  # Runs a prebuilt image. Set ROS_IMAGE=catkin_ws:latest (or whatever the
+  # catkin_ws Dockerfile tags) to use the real workspace image.
+  ros-noetic:
+    image: ${ROS_IMAGE:-ros:noetic-ros-base}
+    container_name: tensegrity-ros-noetic
+    # If ROS_IMAGE already has rosbridge_suite and a sourced overlay, replace
+    # this with: roslaunch rosbridge_server rosbridge_websocket.launch
+    command: >
+      bash -lc "
+        source /opt/ros/noetic/setup.bash &&
+        [ -f /catkin_ws/devel/setup.bash ] && source /catkin_ws/devel/setup.bash;
+        (dpkg -s ros-noetic-rosbridge-suite >/dev/null 2>&1 ||
+          (apt-get update && apt-get install -y --no-install-recommends
+             ros-noetic-rosbridge-suite)) &&
+        roslaunch rosbridge_server rosbridge_websocket.launch
+          --wait address:=0.0.0.0 port:=9090 &
+        roscore
+      "
+    ports: *ros-ports
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+    networks:
+      - tensegrity
+
+  # Builds straight from a local catkin_ws checkout containing the Dockerfile.
+  # Enable with: --profile build (and set CATKIN_WS to the checkout path).
+  ros-noetic-build:
+    profiles: ["build"]
+    build:
+      context: ${CATKIN_WS:-../catkin_ws}
+      dockerfile: ${CATKIN_WS_DOCKERFILE:-Dockerfile}
+    container_name: tensegrity-ros-noetic-build
+    ports: *ros-ports
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+    networks:
+      - tensegrity
+
+networks:
+  tensegrity:
+    driver: bridge
