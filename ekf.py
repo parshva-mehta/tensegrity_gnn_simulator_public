@@ -433,7 +433,8 @@ def run_ekf_rollout(simulator,
                     use_finite_diff=False,
                     Q_quat_inflation=2.0,
                     Q_vel_inflation=2.0,
-                    innovation_gate_sigma=np.inf):
+                    innovation_gate_sigma=np.inf,
+                    publisher=None):
     """Run an EKF rollout over ground-truth data with predict/update steps.
 
     Initializes from start_state or from gt_data[0] (endpoints, linvel, angvel).
@@ -457,6 +458,12 @@ def run_ekf_rollout(simulator,
         Q_vel_inflation: Multiplier for velocity block in process noise (default 2.0).
         innovation_gate_sigma: If finite, reject update when innovation norm exceeds
             this times sqrt(meas_dim) (default np.inf = no gating).
+        publisher: Optional live state sink, called as
+            `publisher.publish_state(time, state)` once for the initial state and
+            once per timestep as frames are produced. Pass a
+            `sim_data_publisher.RodStatePublisher` to stream estimates to ROS
+            (construct it with `rod_names=rod_names_from_simulator(simulator)` so
+            topic names match the state layout). When None, behavior is unchanged.
 
     Returns:
         frames: List of dicts with keys 'time', 'pose', 'state'. Each 'state' is
@@ -524,6 +531,8 @@ def run_ekf_rollout(simulator,
     state_for_frame = start_state
     pose = state_for_frame.reshape(-1, 13, 1)[:, :7].flatten()
     frames.append({"time": time, "pose": pose, "state": state_for_frame.detach().clone()})
+    if publisher is not None:
+        publisher.publish_state(time, state_for_frame)
 
     with torch.no_grad():
         for k, ctrl in enumerate(tqdm.tqdm(ctrls)):
@@ -554,5 +563,7 @@ def run_ekf_rollout(simulator,
             time += dt
             pose = state_for_frame.reshape(-1, 13, 1)[:, :7].flatten()
             frames.append({"time": time, "pose": pose, "state": state_for_frame.detach().clone()})
+            if publisher is not None:
+                publisher.publish_state(time, state_for_frame)
 
     return frames

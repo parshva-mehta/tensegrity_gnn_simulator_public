@@ -1,0 +1,389 @@
+"""Unit tests for sim_data_publisher (no ROS or roslibpy required).
+
+Covers the two convention conversions the design doc flags as error-prone --
+quaternion reordering and the world->body twist rotation -- plus the Odometry
+field mapping and the roslibpy publish path with a mocked client.
+"""
+
+import math
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import sim_data_publisher as sdp
+
+SQRT_HALF = math.sqrt(0.5)
+# 90 degrees about +z, in the repo's (w, x, y, z) order.
+QUAT_Z90 = [SQRT_HALF, 0.0, 0.0, SQRT_HALF]
+IDENTITY_QUAT = [1.0, 0.0, 0.0, 0.0]
+
+
+# -- fake roslibpy -----------------------------------------------------------
+
+class _FakeTopic:
+    # Parameter names mirror roslibpy.Topic.__init__ (message_type, queue_size).
+    def __init__(self, ros, name, message_type, queue_size=100):
+        self.ros = ros
+        self.name = name
+        self.msg_type = message_type
+        self.queue_size = queue_size
+        self.advertised = False
+        self.published = []
+
+    def advertise(self):
+        self.advertised = True
+
+    def unadvertise(self):
+        self.advertised = False
+
+    def publish(self, msg):
+        assert self.advertised, "published before advertise()"
+        self.published.append(msg)
+
+
+class _FakeRos:
+    def __init__(self, host, port, is_secure=False):
+        self.host = host
+        self.port = port
+        self.is_secure = is_secure
+        self.is_connected = False
+        self.terminated = False
+
+    def run(self, timeout=None):
+        self.is_connected = True
+
+    def terminate(self):
+        self.is_connected = False
+        self.terminated = True
+
+
+class _FakeRoslibpy:
+    """Stands in for the roslibpy module in sys.modules."""
+
+    def __init__(self):
+        self.instances = []
+        self.topics = []
+
+    def Ros(self, host, port, is_secure=False):  # noqa: N802 - mirrors roslibpy
+        ros = _FakeRos(host, port, is_secure)
+        self.instances.append(ros)
+        return ros
+
+    def Topic(self, ros, name, message_type, queue_size=100):  # noqa: N802
+        topic = _FakeTopic(ros, name, message_type, queue_size)
+        self.topics.append(topic)
+        return topic
+
+    @staticmethod
+    def Message(msg):  # noqa: N802 - roslibpy.Message is a dict subclass
+        return msg
+
+
+@pytest.fixture
+def fake_roslibpy(monkeypatch):
+    fake = _FakeRoslibpy()
+    monkeypatch.setitem(sys.modules, "roslibpy", fake)
+    return fake
+
+
+# -- quaternion reorder ------------------------------------------------------
+
+def test_quat_reorder_wxyz_to_xyzw():
+    assert sdp.quat_wxyz_to_ros([1.0, 2.0, 3.0, 4.0]) == {
+        "w": 1.0, "x": 2.0, "y": 3.0, "z": 4.0,
+    }
+
+
+def test_quat_reorder_rejects_wrong_length():
+    with pytest.raises(ValueError, match="must have 4 elements"):
+        sdp.quat_wxyz_to_ros([1.0, 0.0, 0.0])
+
+
+# -- world -> body twist rotation -------------------------------------------
+
+def test_rotate_world_to_body_identity_is_noop():
+    out = sdp.rotate_world_to_body(IDENTITY_QUAT, [1.0, 2.0, 3.0])
+    assert out == pytest.approx([1.0, 2.0, 3.0])
+
+
+def test_rotate_world_to_body_z90():
+    """R(q) maps body +x to world +y, so world +y maps back to body +x."""
+    assert sdp.rotate_world_to_body(QUAT_Z90, [0.0, 1.0, 0.0]) == pytest.approx(
+        [1.0, 0.0, 0.0], abs=1e-12
+    )
+    assert sdp.rotate_world_to_body(QUAT_Z90, [1.0, 0.0, 0.0]) == pytest.approx(
+        [0.0, -1.0, 0.0], abs=1e-12
+    )
+    # Rotation axis is unchanged by its own rotation.
+    assert sdp.rotate_world_to_body(QUAT_Z90, [0.0, 0.0, 5.0]) == pytest.approx(
+        [0.0, 0.0, 5.0], abs=1e-12
+    )
+
+
+def test_rotate_world_to_body_preserves_norm():
+    quat = [0.5, 0.5, 0.5, 0.5]
+    vec = [1.0, -2.0, 3.5]
+    out = sdp.rotate_world_to_body(quat, vec)
+    assert math.fsum(v * v for v in out) == pytest.approx(
+        math.fsum(v * v for v in vec)
+    )
+
+
+def test_rotate_world_to_body_normalizes_input_quat():
+    """A non-unit quaternion must not scale the vector."""
+    scaled = [2 * q for q in QUAT_Z90]
+    assert sdp.rotate_world_to_body(scaled, [0.0, 1.0, 0.0]) == pytest.approx(
+        [1.0, 0.0, 0.0], abs=1e-12
+    )
+
+
+def test_rotate_world_to_body_rejects_zero_quat():
+    with pytest.raises(ValueError, match="zero quaternion"):
+        sdp.rotate_world_to_body([0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0])
+
+
+def test_rotate_world_to_body_matches_torch_quaternion():
+    """Agreement with the repo's own reference implementation, where torch exists."""
+    torch = pytest.importorskip("torch")
+    from utilities import torch_quaternion
+
+    quat = [0.5, 0.5, 0.5, 0.5]
+    vec = [1.0, -2.0, 3.5]
+    q_t = torch.tensor(quat, dtype=torch.float64).reshape(1, 4, 1)
+    v_t = torch.tensor(vec, dtype=torch.float64).reshape(1, 3, 1)
+    expected = torch_quaternion.rotate_vec_quat(
+        torch_quaternion.inverse_unit_quat(q_t), v_t
+    ).flatten().tolist()
+
+    assert sdp.rotate_world_to_body(quat, vec) == pytest.approx(expected, abs=1e-12)
+
+
+# -- ROS time ----------------------------------------------------------------
+
+def test_ros_time_from_seconds():
+    assert sdp.ros_time_from_seconds(0.0) == {"secs": 0, "nsecs": 0}
+    assert sdp.ros_time_from_seconds(1.5) == {"secs": 1, "nsecs": 500_000_000}
+    assert sdp.ros_time_from_seconds(2.25) == {"secs": 2, "nsecs": 250_000_000}
+
+
+def test_ros_time_rounding_carries_into_next_second():
+    stamp = sdp.ros_time_from_seconds(1.9999999999)
+    assert stamp == {"secs": 2, "nsecs": 0}
+
+
+# -- Odometry field mapping --------------------------------------------------
+
+def test_build_odometry_msg_field_mapping():
+    msg = sdp.build_odometry_msg(
+        "rod_01",
+        stamp_seconds=1.5,
+        pos=[1.0, 2.0, 3.0],
+        quat=IDENTITY_QUAT,
+        linvel=[0.1, 0.2, 0.3],
+        angvel=[0.4, 0.5, 0.6],
+        frame_id="world",
+        twist_frame="world",
+    )
+
+    assert msg["header"] == {
+        "stamp": {"secs": 1, "nsecs": 500_000_000},
+        "frame_id": "world",
+    }
+    assert msg["child_frame_id"] == "rod_01"
+    assert msg["pose"]["pose"]["position"] == {"x": 1.0, "y": 2.0, "z": 3.0}
+    assert msg["pose"]["pose"]["orientation"] == {
+        "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0,
+    }
+    assert msg["twist"]["twist"]["linear"] == {"x": 0.1, "y": 0.2, "z": 0.3}
+    assert msg["twist"]["twist"]["angular"] == {"x": 0.4, "y": 0.5, "z": 0.6}
+    # v1 leaves covariance zeroed; see the design doc's covariance note.
+    assert msg["pose"]["covariance"] == [0.0] * 36
+    assert msg["twist"]["covariance"] == [0.0] * 36
+
+
+def test_build_odometry_msg_body_twist_rotates_but_pose_does_not():
+    msg = sdp.build_odometry_msg(
+        "rod_01",
+        stamp_seconds=0.0,
+        pos=[1.0, 2.0, 3.0],
+        quat=QUAT_Z90,
+        linvel=[0.0, 1.0, 0.0],
+        angvel=[0.0, 0.0, 2.0],
+        twist_frame="body",
+    )
+    # Position stays world-frame.
+    assert msg["pose"]["pose"]["position"] == {"x": 1.0, "y": 2.0, "z": 3.0}
+    # Orientation is a plain reorder of the (w, x, y, z) input.
+    assert msg["pose"]["pose"]["orientation"]["z"] == pytest.approx(SQRT_HALF)
+    assert msg["pose"]["pose"]["orientation"]["w"] == pytest.approx(SQRT_HALF)
+    # World +y linear velocity becomes body +x.
+    lin = msg["twist"]["twist"]["linear"]
+    assert (lin["x"], lin["y"], lin["z"]) == pytest.approx((1.0, 0.0, 0.0), abs=1e-12)
+    ang = msg["twist"]["twist"]["angular"]
+    assert (ang["x"], ang["y"], ang["z"]) == pytest.approx((0.0, 0.0, 2.0), abs=1e-12)
+
+
+def test_build_odometry_msg_rejects_bad_twist_frame():
+    with pytest.raises(ValueError, match="twist_frame"):
+        sdp.build_odometry_msg(
+            "rod_01", 0.0, [0.0] * 3, IDENTITY_QUAT, [0.0] * 3, [0.0] * 3,
+            twist_frame="inertial",
+        )
+
+
+# -- state splitting ---------------------------------------------------------
+
+def _synthetic_state(n_rods):
+    """Flat state where rod r's block is r*100 + [0..12]."""
+    return [r * 100 + i for r in range(n_rods) for i in range(13)]
+
+
+def test_split_rod_states_slices_13_blocks():
+    rods = sdp.split_rod_states(_synthetic_state(3))
+    assert len(rods) == 3
+    pos, quat, linvel, angvel = rods[1]
+    assert pos == [100.0, 101.0, 102.0]
+    assert quat == [103.0, 104.0, 105.0, 106.0]
+    assert linvel == [107.0, 108.0, 109.0]
+    assert angvel == [110.0, 111.0, 112.0]
+
+
+def test_split_rod_states_rejects_ragged_length():
+    with pytest.raises(ValueError, match="not a multiple of 13"):
+        sdp.split_rod_states([0.0] * 20)
+
+
+def test_split_rod_states_accepts_numpy_column_shape():
+    """run_ekf_rollout passes state shaped (1, 13*n_rods, 1)."""
+    np = pytest.importorskip("numpy")
+    state = np.array(_synthetic_state(3), dtype=np.float64).reshape(1, 39, 1)
+    rods = sdp.split_rod_states(state)
+    assert len(rods) == 3
+    assert rods[2][0] == [200.0, 201.0, 202.0]
+    assert rods[0][3] == [10.0, 11.0, 12.0]
+
+
+def test_split_rod_states_accepts_torch_tensor():
+    torch = pytest.importorskip("torch")
+    state = torch.tensor(_synthetic_state(2), dtype=torch.float64).reshape(1, 26, 1)
+    rods = sdp.split_rod_states(state)
+    assert len(rods) == 2
+    assert rods[1][0] == [100.0, 101.0, 102.0]
+
+
+# -- publisher over mocked roslibpy -----------------------------------------
+
+def test_publisher_advertises_one_topic_per_rod(fake_roslibpy):
+    pub = sdp.RodStatePublisher(
+        url="ws://localhost:9090", rod_names=["rod_01", "rod_23", "rod_45"]
+    )
+    with pub:
+        pub.publish_state(0.0, _synthetic_state(3))
+        pub.publish_state(0.01, _synthetic_state(3))
+
+    names = [t.name for t in fake_roslibpy.topics]
+    assert names == [
+        "/tensegrity/rod_01/odom",
+        "/tensegrity/rod_23/odom",
+        "/tensegrity/rod_45/odom",
+    ]
+    assert all(t.msg_type == "nav_msgs/Odometry" for t in fake_roslibpy.topics)
+    # Topics are advertised once and reused across timesteps.
+    assert [len(t.published) for t in fake_roslibpy.topics] == [2, 2, 2]
+
+
+def test_publisher_parses_url_and_terminates(fake_roslibpy):
+    with sdp.RodStatePublisher(url="wss://ros-noetic:9091", rod_names=["rod_01"]):
+        pass
+    ros = fake_roslibpy.instances[0]
+    assert (ros.host, ros.port, ros.is_secure) == ("ros-noetic", 9091, True)
+    assert ros.terminated
+
+
+def test_publisher_defaults_url_from_env(monkeypatch):
+    monkeypatch.setenv("ROSBRIDGE_URL", "ws://ros-noetic:9090")
+    assert sdp.RodStatePublisher().url == "ws://ros-noetic:9090"
+
+
+def test_publisher_default_url_without_env(monkeypatch):
+    monkeypatch.delenv("ROSBRIDGE_URL", raising=False)
+    assert sdp.RodStatePublisher().url == "ws://localhost:9090"
+
+
+def test_publisher_derives_rod_names_when_unset(fake_roslibpy):
+    with sdp.RodStatePublisher(url="ws://localhost:9090") as pub:
+        pub.publish_state(0.0, _synthetic_state(2))
+    assert pub.rod_names == ["rod_0", "rod_1"]
+
+
+def test_publisher_rejects_rod_name_count_mismatch(fake_roslibpy):
+    with sdp.RodStatePublisher(url="ws://localhost:9090",
+                               rod_names=["rod_01"]) as pub:
+        with pytest.raises(ValueError, match="have 1 rod names"):
+            pub.publish_state(0.0, _synthetic_state(3))
+
+
+def test_publisher_sim_stamp_uses_rollout_time(fake_roslibpy):
+    with sdp.RodStatePublisher(url="ws://localhost:9090", rod_names=["rod_01"],
+                               stamp_source="sim") as pub:
+        pub.publish_state(2.5, _synthetic_state(1))
+    msg = fake_roslibpy.topics[0].published[0]
+    assert msg["header"]["stamp"] == {"secs": 2, "nsecs": 500_000_000}
+
+
+def test_publisher_wall_stamp_ignores_rollout_time(fake_roslibpy):
+    with sdp.RodStatePublisher(url="ws://localhost:9090", rod_names=["rod_01"],
+                               stamp_source="wall") as pub:
+        pub.publish_state(2.5, _synthetic_state(1))
+    msg = fake_roslibpy.topics[0].published[0]
+    # Wall clock is far past the rollout's 2.5s of simulated time.
+    assert msg["header"]["stamp"]["secs"] > 1_600_000_000
+
+
+def test_publisher_rejects_bad_stamp_source():
+    with pytest.raises(ValueError, match="stamp_source"):
+        sdp.RodStatePublisher(stamp_source="clock")
+
+
+def test_publisher_custom_namespace_and_frame(fake_roslibpy):
+    with sdp.RodStatePublisher(url="ws://localhost:9090", rod_names=["rod_01"],
+                               topic_namespace="/est/", frame_id="map") as pub:
+        pub.publish_state(0.0, _synthetic_state(1))
+    assert fake_roslibpy.topics[0].name == "/est/rod_01/odom"
+    assert fake_roslibpy.topics[0].published[0]["header"]["frame_id"] == "map"
+
+
+def test_publish_before_connect_raises():
+    pub = sdp.RodStatePublisher(url="ws://localhost:9090", rod_names=["rod_01"])
+    with pytest.raises(RuntimeError, match="not connected"):
+        pub.publish_state(0.0, _synthetic_state(1))
+
+
+def test_close_is_idempotent_and_unadvertises(fake_roslibpy):
+    pub = sdp.RodStatePublisher(url="ws://localhost:9090", rod_names=["rod_01"])
+    pub.connect()
+    pub.publish_state(0.0, _synthetic_state(1))
+    pub.close()
+    pub.close()
+    assert not fake_roslibpy.topics[0].advertised
+
+
+def test_connect_is_idempotent(fake_roslibpy):
+    pub = sdp.RodStatePublisher(url="ws://localhost:9090", rod_names=["rod_01"])
+    pub.connect()
+    pub.connect()
+    assert len(fake_roslibpy.instances) == 1
+    pub.close()
+
+
+def test_rod_names_from_simulator():
+    class _Robot:
+        rods = {"rod_01": object(), "rod_23": object(), "rod_45": object()}
+
+    class _Sim:
+        robot = _Robot()
+
+    assert sdp.rod_names_from_simulator(_Sim()) == ["rod_01", "rod_23", "rod_45"]
