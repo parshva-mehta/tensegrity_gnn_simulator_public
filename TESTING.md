@@ -156,84 +156,54 @@ pip install -r requirements.txt
 ```
 
 If you have the dataset, the simplest real test is `eval.py`, which already
-writes `./rollout_ekf.txt` via `save_rollout_txt`. To exercise the **live**
-publisher path with or without the dataset, save this as `e2e_check.py` in the
-repo root:
+writes `./rollout_ekf.txt` via `save_rollout_txt`.
 
-```python
-"""Real run_ekf_rollout with both sinks attached."""
-import json
-import numpy as np
-import torch
-
-from ekf import run_ekf_rollout
-from sim_data_publisher import (CompositeSink, RodStatePublisher,
-                                RolloutStateFileWriter, rod_names_from_simulator)
-
-sim = torch.load('sample_model.pt', map_location='cpu')
-sim.eval()
-sim.to('cpu')
-
-cfg = json.load(open('simulators/configs/3_bar_tensegrity_gnn_sim_config.json'))
-rods = cfg['tensegrity_cfg']['rods']
-
-end_pts, pos, quat = [], [], []
-for r in rods:
-    a, b = r['end_pts']
-    end_pts += [a, b]
-    pos.append([(a[i] + b[i]) / 2 for i in range(3)])
-    quat.append([1.0, 0.0, 0.0, 0.0])
-zeros3 = [[0.0] * 3 for _ in rods]
-
-N = 4
-gt = [{'end_pts': end_pts, 'pos': pos, 'quat': quat,
-       'linvel': zeros3, 'angvel': zeros3} for _ in range(N + 1)]
-extra = [{'controls': [0.0] * 6,
-          'rest_lengths': [2.700000047683716] * 6,
-          'motor_speeds': [0.0] * 6} for _ in range(N)]
-
-sinks = CompositeSink(
-    RolloutStateFileWriter('rollout_ekf.txt'),
-    RodStatePublisher(rod_names=rod_names_from_simulator(sim), stamp_source='sim'),
-)
-with sinks:
-    frames = run_ekf_rollout(sim, gt, extra, dt=0.01,
-                             use_finite_diff=True, publisher=sinks)
-
-lines = open('rollout_ekf.txt').read().splitlines()
-print(f"frames returned: {len(frames)}")
-print(f"file lines     : {len(lines)}")
-print(f"columns/line   : {set(len(l.split()) for l in lines)}")
-s = frames[-1]['state'].flatten().tolist()
-print(f"quat norm      : {np.linalg.norm(s[3:7]):.6f}")
-assert len(lines) == len(frames), "file/frame count mismatch"
-print("OK")
-```
-
-To swap in the real dataset, replace the synthetic `gt`/`extra` with:
-
-```python
-data_dir = Path("../tensegrity/data_sets/mjc_synthetic_5d_0.01/val/R2S2Rrolling_7/")
-gt    = json.load((data_dir / "processed_data.json").open('r'))
-extra = json.load((data_dir / "5d_extra_state_data.json").open('r'))
-```
-
-Run it with the container still up:
+To exercise the **live** publisher path, with or without the dataset, use the
+bundled script:
 
 ```bash
-ROSBRIDGE_URL=ws://localhost:9090 python3 e2e_check.py
+# file only
+python3 scripts/e2e_check.py
+
+# file + live Odometry to a running rosbridge
+ROSBRIDGE_URL=ws://localhost:9090 python3 scripts/e2e_check.py --ros
+
+# with the real dataset
+python3 scripts/e2e_check.py --ros \
+    --data-dir ../tensegrity/data_sets/mjc_synthetic_5d_0.01/val/R2S2Rrolling_7/
 ```
+
+Without `--data-dir` it synthesizes `gt_data`/`extra_gt_data` from the robot
+config, so the whole code path runs even if the dataset is not on this machine.
+`--steps` controls the rollout length (default 4), and `--gnn-jacobian` swaps
+finite-difference linearization for the GNN Jacobian.
 
 Expected:
 
 ```
-frames returned: 5
-file lines     : 5
-columns/line   : {39}
-quat norm      : 1.000000
-OK
+loading sample_model.pt ...
+  simulator : TensegrityHybridGNNSimulator
+  rods      : ['rod_01', 'rod_23', 'rod_45']
+  data      : synthetic from simulators/configs/3_bar_tensegrity_gnn_sim_config.json (4 steps)
+  rosbridge : ws://localhost:9090
+
+running EKF rollout ...
+
+checking rollout_ekf.txt ...
+  frames returned : 5
+  file lines      : 5
+  columns/line    : {39} (expected {39})
+    red: com(m)=[-0.0352  0.0243  0.1175]  det(R)=1.000000  |RR^T-I|=2.22e-16
+  green: com(m)=[-0.0171 -0.0258  0.0521]  det(R)=1.000000  |RR^T-I|=2.22e-16
+   blue: com(m)=[ 0.0103 -0.0455  0.1296]  det(R)=1.000000  |RR^T-I|=4.44e-16
+  quat norm       : 1.000000
+
+PASS: rollout ran, every frame reached every sink.
 ```
 
+The script exits non-zero on failure, so it can gate CI.
+
+`frames == file lines` is the assertion that matters: the publisher fired on
 `frames == file lines` is the assertion that matters: the publisher fired on
 every frame including the initial state, and nothing was dropped. `quat norm ==
 1.0` confirms the EKF's quaternion renormalization survived the round trip.
